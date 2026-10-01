@@ -11,7 +11,10 @@ New design:   ffmpeg -> one pipe into RAM -> a small pool of writer threads -> H
   ffmpeg is still decoding. Extraction and disk writing overlap, so a job takes
   roughly max(decode time, write time) instead of decode + copy + delete.
 * Frame numbering is assigned by this program as each JPEG arrives, so numbering is
-  exact and continuous across LosslessCut segments (no parsing of ffmpeg's log).
+  exact and continuous across segments (no parsing of ffmpeg's log).
+* Segments can be marked inside the program (per video, with a frame preview and
+  in/out points) or imported from a LosslessCut CSV, so no separate cutting step
+  is needed before extraction.
 * Decimation is frame-exact (keep frame 0, N, 2N ... of each segment), which is what
   VirtualDub2's "Decimate by N" does. A time-based mode is kept for VFR sources.
 * With NVIDIA decoding the frames stay on the GPU; only the frames that survive
@@ -42,7 +45,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 APP_NAME = "Frame Extractor"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 IS_WIN = os.name == "nt"
 NO_WINDOW = 0x08000000 if IS_WIN else 0          # CREATE_NO_WINDOW
 SCRIPT_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -123,6 +126,17 @@ def fmt_duration(sec: float) -> str:
     h, rem = divmod(sec, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def fmt_tc(sec: Optional[float]) -> str:
+    """Editable timecode: H:MM:SS.mmm (always shows milliseconds)."""
+    if sec is None or sec != sec or sec < 0:
+        return "–"
+    ms = int(round(sec * 1000))
+    h, rem = divmod(ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h}:{m:02d}:{s:02d}.{ms:03d}"
 
 
 def keep_awake(on: bool) -> None:
@@ -247,8 +261,43 @@ def load_segments(csv_path: str) -> list[tuple[float, Optional[float]]]:
     return segs
 
 
+Segs = list[tuple[float, Optional[float]]]
+
+
+def save_segments(csv_path: str, segs: Segs) -> None:
+    """Write segments in LosslessCut's CSV layout (start,end,label) so they can be
+    opened there too, or re-attached to this program later."""
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        for i, (st, en) in enumerate(segs, 1):
+            w.writerow([f"{st:.3f}", "" if en is None else f"{en:.3f}", f"Segment {i}"])
+
+
+def tidy_segments(segs: Segs, duration: float = 0.0) -> Segs:
+    """Sorted by start, clamped to the video, with empty/inverted ranges dropped.
+    An end at (or past) the end of the video becomes 'to EOF' (None)."""
+    out: Segs = []
+    for st, en in segs:
+        st = max(0.0, float(st))
+        if en is not None:
+            en = float(en)
+            if duration > 0 and en >= duration - 0.0005:
+                en = None
+        if en is not None and en <= st + 0.0005:
+            continue
+        if duration > 0 and st >= duration - 0.0005:
+            continue
+        out.append((round(st, 3), None if en is None else round(en, 3)))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def segments_total(segs: Segs, duration: float) -> float:
+    return sum(((e if e is not None else duration) - st) for st, e in segs)
+
+
 def estimate_frames(info: VideoInfo, segs, decimation: int) -> int:
-    total = sum(((e if e is not None else info.duration) - st) for st, e in segs)
+    total = segments_total(segs, info.duration)
     return max(1, int(total * info.avg_fps / max(1, decimation) + 0.999))
 
 
@@ -261,6 +310,22 @@ def find_csv_for(video: str) -> Optional[str]:
     except OSError:
         return None
     return str(cands[0]) if cands else None
+
+
+def grab_frame(video: str, t: float, width: int = 960, timeout: float = 20.0) -> Optional[bytes]:
+    """One JPEG of the frame at time t (accurate seek), scaled to `width`, or None."""
+    ffmpeg = find_tool("ffmpeg")
+    if not ffmpeg:
+        return None
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-threads", "2",
+           "-ss", f"{max(0.0, t):.3f}", "-i", video, "-map", "0:v:0", "-an", "-sn", "-dn",
+           "-frames:v", "1", "-vf", f"scale={int(width)}:-2:flags=fast_bilinear",
+           "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "4", "pipe:1"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=NO_WINDOW)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -379,6 +444,7 @@ class Job:
     video: str
     base_name: str
     csv_path: Optional[str] = None
+    cuts: list = field(default_factory=list)     # segments marked in the program: [(start, end|None)]
     # runtime
     state: str = "queued"      # queued probing extracting flushing done error cancelled
     out_dir: str = ""
@@ -397,11 +463,22 @@ class Job:
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def segments(self) -> list[tuple[float, Optional[float]]]:
+        """In-app cuts win, then an attached CSV, else the whole video."""
+        if self.cuts:
+            return [tuple(c) for c in self.cuts]
         if self.csv_path and os.path.isfile(self.csv_path):
             segs = load_segments(self.csv_path)
             if segs:
                 return segs
         return [(0.0, None)]
+
+    def seg_source(self) -> str:
+        """'cuts', 'csv' or 'whole' – where segments() comes from."""
+        if self.cuts:
+            return "cuts"
+        if self.csv_path and os.path.isfile(self.csv_path) and load_segments(self.csv_path):
+            return "csv"
+        return "whole"
 
     def reset(self) -> None:
         with self.lock:
@@ -620,8 +697,10 @@ class Engine:
         out_dir.mkdir(parents=True, exist_ok=True)
         mark_not_indexed(out_dir)
         job.out_dir = str(out_dir)
-        seg_txt = f"{len(segs)} segment(s) from CSV" if job.csv_path and segs[0] != (0.0, None) \
-            else "whole video"
+        source = job.seg_source()
+        seg_txt = ("whole video" if source == "whole" else
+                   f"{len(segs)} segment(s) " + ("marked in the program" if source == "cuts" else "from CSV")
+                   + f" ({fmt_duration(segments_total(segs, info.duration))} of video)")
         self.log(f"▶ {job.base_name}  —  {info.codec} {info.width}×{info.height} "
                  f"@ {info.fps_num}/{info.fps_den} fps, {seg_txt}, keep 1/{s.decimation}, "
                  f"≈{job.expected} frames "
@@ -786,15 +865,16 @@ def benchmark_drive(folder: str, threads: int, files: int = 1000, size: int = 15
 # ═════════════════════════════════════════════════════════════════════════════
 #  GUI
 # ═════════════════════════════════════════════════════════════════════════════
-from PyQt6.QtCore import Qt, QItemSelectionModel, QTimer, QSettings, QUrl, QRectF, pyqtSignal  # noqa: E402
-from PyQt6.QtGui import (QColor, QFont, QDesktopServices, QIcon, QKeySequence,  # noqa: E402
-                         QPainter, QPalette, QPixmap, QShortcut)
+from PyQt6.QtCore import (Qt, QItemSelectionModel, QObject, QPointF, QRectF, QSettings,  # noqa: E402
+                          QTimer, QUrl, pyqtSignal)
+from PyQt6.QtGui import (QColor, QCursor, QFont, QDesktopServices, QIcon, QKeySequence,  # noqa: E402
+                         QPainter, QPalette, QPen, QPixmap, QPolygonF, QShortcut)
 from PyQt6.QtWidgets import (QAbstractItemView, QAbstractSpinBox, QApplication,  # noqa: E402
                              QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
                              QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
                              QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
                              QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-                             QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem,
+                             QSizePolicy, QSlider, QSpinBox, QTableWidget, QTableWidgetItem,
                              QTextBrowser, QVBoxLayout, QWidget)
 
 ACCENT = "#4c8dff"
@@ -866,6 +946,20 @@ QFrame#scope[scope="item"] { background: #2a2110; border: 1px solid #6b4d16; }
 QLabel#scopeTitle { font-size: 11pt; font-weight: 600; }
 QLineEdit[custom="true"], QSpinBox[custom="true"], QComboBox[custom="true"] { border: 1px solid #d49a2a; }
 QCheckBox[custom="true"] { color: #f0b43c; }
+QLabel#previewFrame { background: #000; border: 1px solid #242a36; border-radius: 8px; color: #6f7a90; }
+QLabel#tc { font-family: Consolas; font-size: 11pt; color: #e6e8ee; }
+QLineEdit#tcEdit { font-family: Consolas; font-size: 11pt; padding: 4px 8px; }
+QLabel#marks { font-family: Consolas; font-size: 9.5pt; color: #f0b43c; }
+QPushButton#step { padding: 6px 10px; min-width: 44px; }
+QPushButton#mark { background: #2a2110; border: 1px solid #6b4d16; color: #f0b43c; font-weight: 600; }
+QPushButton#mark:hover { background: #3a2d14; }
+QPushButton#add { background: #15321f; border: 1px solid #2a6a44; color: #7ee2a8; font-weight: 600; }
+QPushButton#add:hover { background: #1b4229; }
+QPushButton#add:disabled { color: #4d7a60; background: #10231a; border-color: #1f3d2c; }
+QSlider::groove:horizontal { height: 6px; background: #1d222c; border-radius: 3px; }
+QSlider::sub-page:horizontal { background: #4c8dff; border-radius: 3px; }
+QSlider::handle:horizontal { width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; background: #e6e8ee; }
+QSlider::handle:horizontal:hover { background: #ffffff; }
 """
 
 HELP_HTML = """
@@ -986,6 +1080,670 @@ class QueueTable(QTableWidget):
             super().dropEvent(e)
 
 
+class FrameGrabber(QObject):
+    """Background ffmpeg frame grabs for the segment editor. Only the newest preview
+    request is honoured (scrubbing collapses into one grab); filmstrip thumbnails are
+    produced one by one in between."""
+    frameReady = pyqtSignal(float, bytes)
+    thumbReady = pyqtSignal(int, bytes)
+
+    def __init__(self, video: str) -> None:
+        super().__init__()
+        self.video = video
+        self._want: Optional[float] = None
+        self._thumbs: deque = deque()
+        self._cv = threading.Condition()
+        self._stop = False
+        threading.Thread(target=self._run, daemon=True, name="grab").start()
+
+    def request(self, t: float) -> None:
+        with self._cv:
+            self._want = t
+            self._cv.notify()
+
+    def request_thumbs(self, times: list[float]) -> None:
+        with self._cv:
+            self._thumbs = deque(enumerate(times))
+            self._cv.notify()
+
+    def stop(self) -> None:
+        with self._cv:
+            self._stop = True
+            self._cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._stop and self._want is None and not self._thumbs:
+                    self._cv.wait()
+                if self._stop:
+                    return
+                if self._want is not None:
+                    kind, t, idx = "frame", self._want, -1
+                    self._want = None
+                else:
+                    idx, t = self._thumbs.popleft()
+                    kind = "thumb"
+            data = grab_frame(self.video, t, 960 if kind == "frame" else 192)
+            if self._stop or not data:
+                continue
+            if kind == "frame":
+                self.frameReady.emit(t, data)
+            else:
+                self.thumbReady.emit(idx, data)
+
+
+class TimelineBar(QWidget):
+    """Filmstrip of the whole video with the marked segments drawn on top. Click or
+    drag to seek; clicking inside a segment also selects it in the list."""
+    seekRequested = pyqtSignal(float)
+    segmentClicked = pyqtSignal(int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.duration = 1.0
+        self.pos = 0.0
+        self.segs: list = []
+        self.selected = -1
+        self.mark_in: Optional[float] = None
+        self.mark_out: Optional[float] = None
+        self.thumbs: dict[int, QPixmap] = {}
+        self.n_thumbs = 0
+        self.setMinimumHeight(84)
+        self.setMaximumHeight(84)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMouseTracking(True)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    # geometry helpers
+    def _x(self, t: float) -> float:
+        return max(0.0, min(1.0, t / max(self.duration, 1e-6))) * (self.width() - 1)
+
+    def _t(self, x: float) -> float:
+        return max(0.0, min(1.0, x / max(1, self.width() - 1))) * self.duration
+
+    def set_thumb(self, idx: int, pix: QPixmap) -> None:
+        self.thumbs[idx] = pix
+        self.update()
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        strip = QRectF(0, 0, w, h - 14)                     # film area; bottom 14 px = ribbon
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#0b0d11"))
+        p.drawRoundedRect(QRectF(0, 0, w, h), 8, 8)
+        # filmstrip
+        if self.n_thumbs:
+            cell = w / self.n_thumbs
+            for i in range(self.n_thumbs):
+                r = QRectF(i * cell, 0, cell + 0.5, strip.height())
+                pm = self.thumbs.get(i)
+                if pm is not None and not pm.isNull():
+                    scaled = pm.scaled(int(r.width()) + 1, int(r.height()),
+                                       Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                       Qt.TransformationMode.SmoothTransformation)
+                    src = QRectF((scaled.width() - r.width()) / 2, (scaled.height() - r.height()) / 2,
+                                 r.width(), r.height())
+                    p.setOpacity(0.55)
+                    p.drawPixmap(r, scaled, src)
+                    p.setOpacity(1.0)
+                else:
+                    p.setBrush(QColor("#12151c" if i % 2 else "#141821"))
+                    p.drawRect(r)
+        # dim everything, then un-dim the kept ranges
+        p.setBrush(QColor(0, 0, 0, 110))
+        p.drawRect(strip)
+        for i, (st, en) in enumerate(self.segs):
+            x0, x1 = self._x(st), self._x(en if en is not None else self.duration)
+            sel = i == self.selected
+            fill = QColor(ACCENT)
+            fill.setAlpha(70 if sel else 40)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill)
+            p.drawRect(QRectF(x0, 0, max(1.0, x1 - x0), strip.height()))
+            p.setBrush(QColor("#6a9fff" if sel else ACCENT))
+            p.drawRoundedRect(QRectF(x0, h - 12, max(2.0, x1 - x0), 10), 3, 3)
+            pen = QPen(QColor("#ffffff" if sel else "#9ec1ff"), 1.5 if sel else 1)
+            p.setPen(pen)
+            p.drawLine(QPointF(x0, 0), QPointF(x0, strip.height()))
+            p.drawLine(QPointF(x1, 0), QPointF(x1, strip.height()))
+            if x1 - x0 > 22:
+                p.setPen(QColor("#ffffff"))
+                f = p.font()
+                f.setPointSizeF(7.5)
+                f.setBold(True)
+                p.setFont(f)
+                p.drawText(QRectF(x0 + 4, 2, x1 - x0 - 8, 14), Qt.AlignmentFlag.AlignLeft, str(i + 1))
+        # pending in/out marks
+        for t, is_in in ((self.mark_in, True), (self.mark_out, False)):
+            if t is None:
+                continue
+            x = self._x(t)
+            amber = QColor("#f0b43c")
+            p.setPen(QPen(amber, 2))
+            p.drawLine(QPointF(x, 0), QPointF(x, h))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(amber)
+            tri = QPolygonF([QPointF(x, 10), QPointF(x + (8 if is_in else -8), 4), QPointF(x + (8 if is_in else -8), 16)])
+            p.drawPolygon(tri)
+        if self.mark_in is not None and self.mark_out is not None and self.mark_out > self.mark_in:
+            amber = QColor("#f0b43c")
+            amber.setAlpha(45)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(amber)
+            p.drawRect(QRectF(self._x(self.mark_in), 0, self._x(self.mark_out) - self._x(self.mark_in), strip.height()))
+        # playhead
+        x = self._x(self.pos)
+        p.setPen(QPen(QColor("#ffffff"), 2))
+        p.drawLine(QPointF(x, 0), QPointF(x, h))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#ffffff"))
+        p.drawPolygon(QPolygonF([QPointF(x - 6, h), QPointF(x + 6, h), QPointF(x, h - 7)]))
+        p.end()
+
+    def _hit(self, x: float) -> int:
+        t = self._t(x)
+        for i, (st, en) in enumerate(self.segs):
+            if st <= t <= (en if en is not None else self.duration):
+                return i
+        return -1
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            x = e.position().x()
+            hit = self._hit(x)
+            if hit >= 0:
+                self.segmentClicked.emit(hit)
+            self.seekRequested.emit(self._t(x))
+
+    def mouseMoveEvent(self, e) -> None:
+        if e.buttons() & Qt.MouseButton.LeftButton:
+            self.seekRequested.emit(self._t(e.position().x()))
+        else:
+            self.setToolTip(fmt_tc(self._t(e.position().x())))
+
+
+class SegmentDialog(QDialog):
+    """Mark the parts of one video to extract. Scrub with the slider / filmstrip or
+    step frame by frame, press I and O for in/out points, Enter to add the segment."""
+    N_THUMBS = 28
+
+    def __init__(self, parent, job: Job, info: VideoInfo, decimation: int) -> None:
+        super().__init__(parent)
+        self.job, self.info, self.decimation = job, info, decimation
+        self.dur = info.duration if info.duration > 0 else 1.0
+        self.fps = info.avg_fps if info.avg_fps > 0 else (info.fps_num / info.fps_den if info.fps_den else 25.0)
+        self.frame = 1.0 / self.fps
+        self.segs: Segs = tidy_segments(job.segments() if job.seg_source() != "whole" else [], self.dur)
+        self._orig = list(self.segs)
+        self.t = 0.0
+        self.mark_in: Optional[float] = None
+        self.mark_out: Optional[float] = None
+        self._pix: Optional[QPixmap] = None
+        self._loading = False
+        self.setWindowTitle(f"Segments – {job.base_name}")
+        self.resize(1240, 760)
+        self.setSizeGripEnabled(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._build()
+        self.grabber = FrameGrabber(job.video)
+        self.grabber.frameReady.connect(self._frame_ready)
+        self.grabber.thumbReady.connect(self._thumb_ready)
+        self.timeline.n_thumbs = self.N_THUMBS
+        self.grabber.request_thumbs([(i + 0.5) * self.dur / self.N_THUMBS for i in range(self.N_THUMBS)])
+        self._refresh_list()
+        self._seek(self.segs[0][0] if self.segs else 0.0)
+
+    # ── layout ──────────────────────────────────────────────────────────
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 12)
+        root.setSpacing(10)
+        top = QHBoxLayout()
+        top.addWidget(label(f"{Path(self.job.video).name}", "cardTitle"))
+        top.addStretch(1)
+        top.addWidget(label(f"{self.info.codec} {self.info.width}×{self.info.height} · "
+                            f"{self.fps:.3f} fps · {fmt_duration(self.dur)}", "hint"))
+        root.addLayout(top)
+        root.addWidget(label("Only the marked segments are extracted; frame numbering runs on continuously "
+                             "from one segment to the next. The In point is the first frame kept and "
+                             "the Out point is the last frame kept.", "hint", wrap=True))
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        root.addLayout(body, 1)
+
+        # left: preview + transport
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        self.preview = QLabel("Loading frame…")
+        self.preview.setObjectName("previewFrame")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumSize(560, 315)
+        self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        left.addWidget(self.preview, 1)
+        self.timeline = TimelineBar()
+        self.timeline.duration = self.dur
+        self.timeline.seekRequested.connect(lambda t: self._seek(t))
+        self.timeline.segmentClicked.connect(self._select_row)
+        left.addWidget(self.timeline)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, int(self.dur * 1000))
+        self.slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.slider.valueChanged.connect(self._slider_moved)
+        left.addWidget(self.slider)
+
+        trans = QHBoxLayout()
+        trans.setSpacing(6)
+        self.tc_edit = QLineEdit()
+        self.tc_edit.setObjectName("tcEdit")
+        self.tc_edit.setFixedWidth(130)
+        self.tc_edit.setToolTip("Type a time (h:mm:ss.mmm or seconds) and press Enter to jump there")
+        self.tc_edit.setFocusPolicy(Qt.FocusPolicy.ClickFocus)      # keys stay with the editor until clicked
+        self.tc_edit.editingFinished.connect(self._tc_entered)
+        trans.addWidget(self.tc_edit)
+        trans.addWidget(label(f"/ {fmt_tc(self.dur)}", "hint"))
+        self.frame_lbl = label("", "hint")
+        trans.addWidget(self.frame_lbl)
+        trans.addStretch(1)
+        for text, tip, fr, sec in (("⏮", "Start of video (Home)", None, None),
+                                   ("−10s", "Back 10 seconds (Ctrl+←)", 0, -10.0),
+                                   ("−1s", "Back 1 second (Shift+←)", 0, -1.0),
+                                   ("◂ 1f", "Back one frame (←)", -1, 0.0),
+                                   ("1f ▸", "Forward one frame (→)", 1, 0.0),
+                                   ("+1s", "Forward 1 second (Shift+→)", 0, 1.0),
+                                   ("+10s", "Forward 10 seconds (Ctrl+→)", 0, 10.0),
+                                   ("⏭", "End of video (End)", None, None)):
+            b = QPushButton(text)
+            b.setObjectName("step")
+            b.setToolTip(tip)
+            b.setAutoDefault(False)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            if fr is None:
+                b.clicked.connect((lambda: self._seek(0.0)) if text == "⏮" else (lambda: self._seek(self.dur)))
+            else:
+                b.clicked.connect(lambda _=False, f=fr, s=sec: self._step(f, s))
+            trans.addWidget(b)
+        left.addLayout(trans)
+
+        marks = QHBoxLayout()
+        marks.setSpacing(8)
+        self.b_in = QPushButton("⟦  Set In   (I)")
+        self.b_in.setObjectName("mark")
+        self.b_in.clicked.connect(self._set_in)
+        self.b_out = QPushButton("Set Out  (O)  ⟧")
+        self.b_out.setObjectName("mark")
+        self.b_out.clicked.connect(self._set_out)
+        self.marks_lbl = label("", "marks")
+        self.b_clear_marks = QPushButton("Clear marks")
+        self.b_clear_marks.setObjectName("ghost")
+        self.b_clear_marks.clicked.connect(self._clear_marks)
+        self.b_addseg = QPushButton("＋  Add segment  (Enter)")
+        self.b_addseg.setObjectName("add")
+        self.b_addseg.clicked.connect(self._add_segment)
+        for b in (self.b_in, self.b_out, self.b_clear_marks, self.b_addseg):
+            b.setAutoDefault(False)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        marks.addWidget(self.b_in)
+        marks.addWidget(self.b_out)
+        marks.addWidget(self.marks_lbl, 1)
+        marks.addWidget(self.b_clear_marks)
+        marks.addWidget(self.b_addseg)
+        left.addLayout(marks)
+        body.addLayout(left, 1)
+
+        # right: the list
+        rcard, rl = card()
+        rcard.setFixedWidth(360)
+        rh = QHBoxLayout()
+        self.list_title = label("Segments", "cardTitle")
+        rh.addWidget(self.list_title)
+        rh.addStretch(1)
+        rl.addLayout(rh)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Start", "End", "Length"])
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.table.verticalHeader().setDefaultSectionSize(32)
+        self.table.setShowGrid(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                                   | QAbstractItemView.EditTrigger.EditKeyPressed)
+        self.table.itemChanged.connect(self._cell_edited)
+        self.table.cellClicked.connect(self._cell_clicked)
+        self.table.itemSelectionChanged.connect(self._list_selection)
+        self.table.setToolTip("Click a row to jump to it. Double-click a time to edit it.")
+        self.table.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        rl.addWidget(self.table, 1)
+        self.sum_lbl = label("", "hint", wrap=True)
+        rl.addWidget(self.sum_lbl)
+        rb = QGridLayout()
+        rb.setSpacing(6)
+        self.b_remove = QPushButton("Remove")
+        self.b_remove.clicked.connect(self._remove_rows)
+        self.b_clear = QPushButton("Clear all")
+        self.b_clear.clicked.connect(self._clear_all)
+        self.b_import = QPushButton("Import CSV…")
+        self.b_import.setToolTip("Load segments from a LosslessCut CSV")
+        self.b_import.clicked.connect(self._import_csv)
+        self.b_export = QPushButton("Export CSV…")
+        self.b_export.setToolTip("Save these segments as a LosslessCut-compatible CSV")
+        self.b_export.clicked.connect(self._export_csv)
+        for i, b in enumerate((self.b_remove, self.b_clear, self.b_import, self.b_export)):
+            b.setAutoDefault(False)
+            rb.addWidget(b, i // 2, i % 2)
+        rl.addLayout(rb)
+        body.addWidget(rcard)
+
+        foot = QHBoxLayout()
+        foot.addWidget(label("Keys:  ← →  frame · Shift ±1 s · Ctrl ±10 s ·  I / O  in / out ·  "
+                             "Enter  add segment ·  Delete  remove selected", "hint", wrap=True), 1)
+        bb = QDialogButtonBox()
+        self.b_ok = bb.addButton("Save segments", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.b_ok.setObjectName("primary")
+        self.b_cancel = bb.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        for b in (self.b_ok, self.b_cancel):
+            b.setAutoDefault(False)
+            b.setDefault(False)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        foot.addWidget(bb)
+        root.addLayout(foot)
+
+    # ── seeking & preview ──────────────────────────────────────────────
+    def _snap(self, t: float) -> float:
+        t = max(0.0, min(t, max(0.0, self.dur - self.frame)))
+        return round(round(t * self.fps) / self.fps, 4)
+
+    def _seek(self, t: float) -> None:
+        self.t = self._snap(t)
+        self._loading = True
+        try:
+            self.slider.setValue(int(round(self.t * 1000)))
+            if not self.tc_edit.hasFocus():
+                self.tc_edit.setText(fmt_tc(self.t))
+        finally:
+            self._loading = False
+        self.frame_lbl.setText(f"frame {int(round(self.t * self.fps)):,}")
+        self.timeline.pos = self.t
+        self.timeline.update()
+        self.grabber.request(self.t)
+
+    def _slider_moved(self, v: int) -> None:
+        if not self._loading:
+            self._seek(v / 1000.0)
+
+    def _step(self, frames: int, secs: float) -> None:
+        self._seek(self.t + frames * self.frame + secs)
+
+    def _tc_entered(self) -> None:
+        t = parse_time(self.tc_edit.text())
+        if t is None:
+            self.tc_edit.setText(fmt_tc(self.t))
+            return
+        self._seek(t)
+        self.tc_edit.setText(fmt_tc(self.t))
+        self.tc_edit.clearFocus()
+        self.setFocus()
+
+    def _frame_ready(self, t: float, data: bytes) -> None:
+        pm = QPixmap()
+        if pm.loadFromData(bytes(data)):
+            self._pix = pm
+            self._fit_preview()
+
+    def _thumb_ready(self, idx: int, data: bytes) -> None:
+        pm = QPixmap()
+        if pm.loadFromData(bytes(data)):
+            self.timeline.set_thumb(idx, pm)
+
+    def _fit_preview(self) -> None:
+        if self._pix is None:
+            return
+        area = self.preview.contentsRect().size()
+        self.preview.setPixmap(self._pix.scaled(area, Qt.AspectRatioMode.KeepAspectRatio,
+                                                Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._fit_preview()
+
+    def showEvent(self, e) -> None:
+        super().showEvent(e)
+        self.setFocus()                 # so I / O / arrows work straight away
+
+    # ── in / out marks ──────────────────────────────────────────────────
+    def _set_in(self) -> None:
+        self.mark_in = self.t
+        if self.mark_out is not None and self.mark_out < self.mark_in:
+            self.mark_out = None
+        self._marks_changed()
+
+    def _set_out(self) -> None:
+        self.mark_out = self.t
+        if self.mark_in is not None and self.mark_in > self.mark_out:
+            self.mark_in = None
+        self._marks_changed()
+
+    def _clear_marks(self) -> None:
+        self.mark_in = self.mark_out = None
+        self._marks_changed()
+
+    def _marks_changed(self) -> None:
+        self.timeline.mark_in, self.timeline.mark_out = self.mark_in, self.mark_out
+        self.timeline.update()
+        bits = []
+        if self.mark_in is not None:
+            bits.append(f"In {fmt_tc(self.mark_in)}")
+        if self.mark_out is not None:
+            bits.append(f"Out {fmt_tc(self.mark_out)}")
+        if self.mark_in is not None and self.mark_out is not None:
+            bits.append(f"({fmt_duration(self.mark_out + self.frame - self.mark_in)})")
+        self.marks_lbl.setText("   ".join(bits))
+        self.b_clear_marks.setVisible(bool(bits))
+        self.b_addseg.setEnabled(bool(bits))
+        self.b_addseg.setToolTip("Adds In → Out. With only an In point the segment runs to the end of "
+                                 "the video; with only an Out point it starts at the beginning.")
+
+    def _add_segment(self) -> None:
+        if self.mark_in is None and self.mark_out is None:
+            return
+        st = self.mark_in if self.mark_in is not None else 0.0
+        en = None if self.mark_out is None else self.mark_out + self.frame
+        new = tidy_segments([(st, en)], self.dur)
+        if not new:
+            return
+        self.segs = tidy_segments(self.segs + new, self.dur)
+        self.mark_in = self.mark_out = None
+        self._marks_changed()
+        self._refresh_list(select=self.segs.index(new[0]) if new[0] in self.segs else -1)
+
+    # ── list ────────────────────────────────────────────────────────────
+    def _refresh_list(self, select: int = -1) -> None:
+        self._loading = True
+        try:
+            self.table.setRowCount(len(self.segs))
+            for r, (st, en) in enumerate(self.segs):
+                end_t = en if en is not None else self.dur
+                cells = (fmt_tc(st), fmt_tc(en) if en is not None else "end", fmt_duration(end_t - st))
+                for c, text in enumerate(cells):
+                    it = QTableWidgetItem(text)
+                    if c == 2:
+                        it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                        it.setForeground(QColor("#9aa3b5"))
+                    self.table.setItem(r, c, it)
+            if 0 <= select < len(self.segs):
+                self.table.selectRow(select)
+        finally:
+            self._loading = False
+        self.timeline.segs = list(self.segs)
+        self.timeline.selected = self.table.currentRow() if self.table.selectedItems() else -1
+        self.timeline.update()
+        n = len(self.segs)
+        self.list_title.setText(f"Segments ({n})" if n else "Segments")
+        if n:
+            kept = segments_total(self.segs, self.dur)
+            frames = int(kept * self.fps / max(1, self.decimation) + 0.999)
+            self.sum_lbl.setText(f"{fmt_duration(kept)} of {fmt_duration(self.dur)} kept "
+                                 f"({100 * kept / self.dur:.0f}%) · ≈{frames:,} frames at keep 1/{self.decimation}")
+        else:
+            self.sum_lbl.setText("No segments yet: the whole video would be extracted. Mark an In and an "
+                                 "Out point, then press Enter.")
+        self.b_remove.setEnabled(n > 0)
+        self.b_clear.setEnabled(n > 0)
+        self.b_export.setEnabled(n > 0)
+
+    def _selected_rows(self) -> list[int]:
+        return sorted({i.row() for i in self.table.selectionModel().selectedRows()})
+
+    def _select_row(self, r: int) -> None:
+        if 0 <= r < self.table.rowCount():
+            self.table.selectRow(r)
+
+    def _list_selection(self) -> None:
+        if self._loading:
+            return
+        rows = self._selected_rows()
+        self.timeline.selected = rows[0] if len(rows) == 1 else -1
+        self.timeline.update()
+
+    def _cell_clicked(self, r: int, c: int) -> None:
+        if not (0 <= r < len(self.segs)):
+            return
+        st, en = self.segs[r]
+        if c == 1:
+            self._seek((en if en is not None else self.dur) - self.frame)
+        else:
+            self._seek(st)
+
+    def _cell_edited(self, item: QTableWidgetItem) -> None:
+        if self._loading or item.column() > 1:
+            return
+        r = item.row()
+        if not (0 <= r < len(self.segs)):
+            return
+        st, en = self.segs[r]
+        txt = item.text().strip().lower()
+        if item.column() == 0:
+            v = parse_time(txt)
+            if v is not None:
+                st = v
+        else:
+            en = None if txt in ("", "end", "eof", "–", "-") else parse_time(txt)
+            if en is None and txt not in ("", "end", "eof", "–", "-"):
+                en = self.segs[r][1]
+        fixed = tidy_segments([(st, en)], self.dur)
+        rest = self.segs[:r] + self.segs[r + 1:]
+        self.segs = tidy_segments(rest + fixed, self.dur)
+        self._refresh_list(select=self.segs.index(fixed[0]) if fixed and fixed[0] in self.segs else -1)
+
+    def _remove_rows(self) -> None:
+        rows = set(self._selected_rows())
+        if not rows:
+            return
+        self.segs = [s for i, s in enumerate(self.segs) if i not in rows]
+        self._refresh_list()
+
+    def _clear_all(self) -> None:
+        if self.segs and QMessageBox.question(self, "Clear segments", "Remove all segments for this video?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self.segs = []
+        self._refresh_list()
+
+    def _import_csv(self) -> None:
+        f, _ = QFileDialog.getOpenFileName(self, "LosslessCut segments CSV", os.path.dirname(self.job.video),
+                                           "CSV files (*.csv);;All files (*)")
+        if not f:
+            return
+        try:
+            segs = tidy_segments(load_segments(f), self.dur)
+        except OSError as ex:
+            QMessageBox.warning(self, APP_NAME, f"Can't read the CSV:\n{ex}")
+            return
+        if not segs:
+            QMessageBox.information(self, APP_NAME, "No segments were found in that file.")
+            return
+        if self.segs and QMessageBox.question(self, "Import CSV", f"Replace the current {len(self.segs)} "
+                                              f"segment(s) with the {len(segs)} from the CSV?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self.segs = segs
+        self._refresh_list()
+
+    def _export_csv(self) -> None:
+        if not self.segs:
+            return
+        default = str(Path(self.job.video).with_name(Path(self.job.video).stem + "-segments.csv"))
+        f, _ = QFileDialog.getSaveFileName(self, "Save segments as CSV", default, "CSV files (*.csv)")
+        if not f:
+            return
+        try:
+            save_segments(f, self.segs)
+        except OSError as ex:
+            QMessageBox.warning(self, APP_NAME, f"Can't write the CSV:\n{ex}")
+
+    # ── keys & lifecycle ────────────────────────────────────────────────
+    def keyPressEvent(self, e) -> None:
+        fw = self.focusWidget()
+        typing = isinstance(fw, (QLineEdit, QAbstractSpinBox)) or (fw is not None and self.table.isAncestorOf(fw))
+        in_table = fw is not None and (fw is self.table or self.table.isAncestorOf(fw))
+        k, mods = e.key(), e.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        if in_table and k == Qt.Key.Key_Delete and self.table.state() != QAbstractItemView.State.EditingState:
+            self._remove_rows()
+            return
+        if not typing:
+            if k in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+                sign = -1 if k == Qt.Key.Key_Left else 1
+                if ctrl:
+                    self._step(0, 10.0 * sign)
+                elif shift:
+                    self._step(0, 1.0 * sign)
+                else:
+                    self._step(sign, 0.0)
+                return
+            if k == Qt.Key.Key_Home:
+                self._seek(0.0)
+                return
+            if k == Qt.Key.Key_End:
+                self._seek(self.dur)
+                return
+            if k == Qt.Key.Key_I:
+                self._set_in()
+                return
+            if k == Qt.Key.Key_O:
+                self._set_out()
+                return
+            if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Plus):
+                self._add_segment()
+                return
+            if k == Qt.Key.Key_Delete:
+                self._remove_rows()
+                return
+            if k == Qt.Key.Key_Escape and (self.mark_in is not None or self.mark_out is not None):
+                self._clear_marks()
+                return
+        super().keyPressEvent(e)
+
+    def reject(self) -> None:
+        if self.segs != self._orig or self.mark_in is not None or self.mark_out is not None:
+            r = QMessageBox.question(self, "Discard changes?",
+                                     "The segments for this video have changed. Close without saving them?")
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        super().reject()
+
+    def done(self, result: int) -> None:
+        self.grabber.stop()
+        super().done(result)
+
+
 class HelpDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1093,7 +1851,8 @@ class MainWindow(QMainWindow):
         ql.addLayout(top)
 
         self.table = QueueTable()
-        self.table.setHorizontalHeaderLabels(["Name  ✎ (double-click)", "Source video", "Segments", "Saves to", "Progress"])
+        self.table.setHorizontalHeaderLabels(["Name  ✎ (double-click)", "Source video",
+                                              "Segments  ✂ (double-click)", "Saves to", "Progress"])
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.Interactive)
         hh.setSectionResizeMode(self.COL_SRC, QHeaderView.ResizeMode.Interactive)
@@ -1115,10 +1874,14 @@ class MainWindow(QMainWindow):
         self.table.itemChanged.connect(self._item_changed)
         self.table.itemSelectionChanged.connect(self._selection_changed)
         self.table.filesDropped.connect(self._files_dropped)
+        self.table.cellDoubleClicked.connect(
+            lambda _r, c: self._edit_segments() if c == self.COL_SEG else None)
         ql.addWidget(self.table, 1)
 
-        self.empty_lbl = label("Drop episode videos here (and LosslessCut CSVs onto a row)\n"
-                               "or click “Add videos”.", "empty")
+        self.empty_lbl = label("Drop episode videos here or click “Add videos”.\n\n"
+                               "Then double-click a row's Segments cell (or press “Segments…”) to mark the "
+                               "parts of each video to extract.\nLosslessCut CSVs can also be dropped onto a row.",
+                               "empty")
         self.empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.empty_lbl.setParent(self.table.viewport())
@@ -1126,7 +1889,12 @@ class MainWindow(QMainWindow):
         btns = QHBoxLayout()
         self.b_add = QPushButton("＋  Add videos")
         self.b_add.clicked.connect(self._add_dialog)
+        self.b_segs = QPushButton("✂  Segments…")
+        self.b_segs.setToolTip("Mark the parts of the selected video to extract (with a frame preview). "
+                               "Each video in the queue has its own segments.")
+        self.b_segs.clicked.connect(self._edit_segments)
         self.b_csv = QPushButton("Attach CSV…")
+        self.b_csv.setToolTip("Use segments from a LosslessCut CSV for the selected row")
         self.b_csv.clicked.connect(self._attach_csv)
         self.b_rename = QPushButton("Rename")
         self.b_rename.setToolTip("Rename the selected entry (or double-click the name / press F2)")
@@ -1135,13 +1903,13 @@ class MainWindow(QMainWindow):
         self.b_auto.setToolTip("Name entries like 'S1E06 Dalek' from filenames such as '6 - Dalek'")
         self.b_auto.clicked.connect(self._auto_name_dialog)
         self.b_nocsv = QPushButton("Whole video")
-        self.b_nocsv.setToolTip("Ignore the CSV for the selected rows and extract the whole video")
+        self.b_nocsv.setToolTip("Drop the segments / CSV of the selected rows and extract the whole video")
         self.b_nocsv.clicked.connect(self._clear_csv)
         self.b_remove = QPushButton("Remove")
         self.b_remove.clicked.connect(self._remove_selected)
         self.b_clear = QPushButton("Clear finished")
         self.b_clear.clicked.connect(self._clear_finished)
-        for b in (self.b_add, self.b_rename, self.b_auto, self.b_csv, self.b_nocsv):
+        for b in (self.b_add, self.b_segs, self.b_csv, self.b_nocsv, self.b_rename, self.b_auto):
             btns.addWidget(b)
         btns.addStretch(1)
         btns.addWidget(self.b_remove)
@@ -1314,6 +2082,13 @@ class MainWindow(QMainWindow):
             quality=q.value("quality", d.quality, int),
         )
         self._set_combo(self.dec_combo, q.value("decoder", "auto", str))
+        self.cuts_store: dict[str, list] = {}
+        try:
+            raw = json.loads(q.value("cuts_store", "{}", str) or "{}")
+            if isinstance(raw, dict):
+                self.cuts_store = {k: v for k, v in raw.items() if isinstance(v, list)}
+        except (ValueError, TypeError):
+            pass
         self.thr_spin.setValue(q.value("writer_threads", 4, int))
         self.buf_spin.setValue(q.value("buffer_mb", 1024, int))
         geo = q.value("geometry")
@@ -1326,6 +2101,26 @@ class MainWindow(QMainWindow):
         for k, v in vars(s).items():
             self.qs.setValue(k, v)
         self.qs.setValue("geometry", self.saveGeometry())
+        self._save_cuts_store()
+
+    # segments marked in the program are remembered per video so they survive a restart
+    CUTS_REMEMBERED = 400
+
+    @staticmethod
+    def _cuts_key(video: str) -> str:
+        return os.path.normcase(os.path.abspath(video))
+
+    def _remember_cuts(self, j: Job) -> None:
+        key = self._cuts_key(j.video)
+        self.cuts_store.pop(key, None)
+        if j.cuts:
+            self.cuts_store[key] = [list(c) for c in j.cuts]
+            while len(self.cuts_store) > self.CUTS_REMEMBERED:
+                self.cuts_store.pop(next(iter(self.cuts_store)))
+        self._save_cuts_store()
+
+    def _save_cuts_store(self) -> None:
+        self.qs.setValue("cuts_store", json.dumps(self.cuts_store))
 
     @staticmethod
     def _set_combo(combo: QComboBox, key: str) -> None:
@@ -1486,8 +2281,10 @@ class MainWindow(QMainWindow):
             if not rows and len(self.jobs) == 1:
                 rows = [0]
             if len(rows) == 1:
-                self.jobs[rows[0]].csv_path = csvs[0]
-                self._job_settings_changed(self.jobs[rows[0]])
+                j = self.jobs[rows[0]]
+                j.csv_path, j.cuts = csvs[0], []
+                self._remember_cuts(j)
+                self._job_settings_changed(j)
             else:
                 self._flash("Select one row first, then drop the CSV onto it", warn=True)
 
@@ -1585,7 +2382,11 @@ class MainWindow(QMainWindow):
             if key in have:
                 continue
             have.add(key)
-            new.append(Job(video=f, base_name=default_base_name(f), csv_path=find_csv_for(f)))
+            j = Job(video=f, base_name=default_base_name(f), csv_path=find_csv_for(f))
+            remembered = self.cuts_store.get(self._cuts_key(f))
+            if remembered:
+                j.cuts = tidy_segments([(c[0], c[1]) for c in remembered if isinstance(c, list) and len(c) == 2])
+            new.append(j)
         self.jobs += new
         if new and not self.defaults.output_root:
             self.defaults.output_root = os.path.dirname(new[0].video)
@@ -1603,6 +2404,7 @@ class MainWindow(QMainWindow):
                     j.expected = estimate_frames(j.info, j.segments(), self._eff(j).decimation)
             except Exception as e:  # noqa: BLE001
                 j.error = f"Can't read video: {e}"
+        self._probed = True          # picked up by _tick to refresh the Segments column
 
     def _job_settings_changed(self, j: Job) -> None:
         if j.info and j.state == "queued":
@@ -1621,13 +2423,56 @@ class MainWindow(QMainWindow):
         f, _ = QFileDialog.getOpenFileName(self, "LosslessCut segments CSV", os.path.dirname(j.video),
                                            "CSV files (*.csv);;All files (*)")
         if f:
-            j.csv_path = f
+            j.csv_path, j.cuts = f, []
+            self._remember_cuts(j)
             self._job_settings_changed(j)
 
     def _clear_csv(self) -> None:
         for r in self._selected_rows():
-            self.jobs[r].csv_path = None
-            self._job_settings_changed(self.jobs[r])
+            j = self.jobs[r]
+            j.csv_path, j.cuts = None, []
+            self._remember_cuts(j)
+            self._job_settings_changed(j)
+
+    def _edit_segments(self) -> None:
+        if self._running():
+            return
+        rows = self._selected_rows()
+        if not rows and len(self.jobs) == 1:
+            rows = [0]
+        if len(rows) != 1:
+            self._flash("Select one row to edit its segments", warn=True)
+            return
+        j = self.jobs[rows[0]]
+        if not os.path.isfile(j.video):
+            QMessageBox.warning(self, APP_NAME, f"Video not found:\n{j.video}")
+            return
+        if not find_tool("ffmpeg") or not find_tool("ffprobe"):
+            QMessageBox.critical(self, APP_NAME, "ffmpeg and ffprobe weren't found. Put them on PATH "
+                                                 "or in the same folder as this program.")
+            return
+        if j.info is None:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                j.info = probe_video(j.video)
+            except Exception as ex:  # noqa: BLE001
+                QMessageBox.warning(self, APP_NAME, f"Can't read the video:\n{ex}")
+                return
+            finally:
+                QApplication.restoreOverrideCursor()
+        if j.info.duration <= 0:
+            QMessageBox.warning(self, APP_NAME, "ffprobe reports no duration for this video, so it can't be "
+                                                "scrubbed. A LosslessCut CSV can still be attached.")
+            return
+        dlg = SegmentDialog(self, j, j.info, self._eff(j).decimation)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            j.cuts = [tuple(s) for s in dlg.segs]
+            if j.cuts:
+                j.csv_path = None
+            self._remember_cuts(j)
+            self._job_settings_changed(j)
+            n = len(j.cuts)
+            self._flash(f"{j.base_name}: {n} segment(s) marked" if n else f"{j.base_name}: whole video", ok=True)
 
     def _remove_selected(self) -> None:
         if self._running():
@@ -1656,6 +2501,7 @@ class MainWindow(QMainWindow):
         a_open.setEnabled(os.path.isdir(target))
         a_src = m.addAction("Show source video")
         m.addSeparator()
+        a_segs = m.addAction("Edit segments…")
         a_csv = m.addAction("Attach CSV…")
         a_nocsv = m.addAction("Use whole video")
         a_requeue = m.addAction("Queue again")
@@ -1663,14 +2509,17 @@ class MainWindow(QMainWindow):
         a_reset.setEnabled(not self._running() and any(x.overrides for x in self._scope()))
         m.addSeparator()
         a_rm = m.addAction("Remove")
-        for a in (a_csv, a_nocsv, a_requeue, a_rm):
+        for a in (a_segs, a_csv, a_nocsv, a_requeue, a_rm):
             a.setEnabled(not self._running())
+        a_segs.setEnabled(not self._running() and len(self._selected_rows()) == 1)
         a_requeue.setEnabled(not self._running() and j.state != "queued")
         act = m.exec(self.table.viewport().mapToGlobal(pos))
         if act == a_open:
             QDesktopServices.openUrl(QUrl.fromLocalFile(target))
         elif act == a_src:
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(j.video)))
+        elif act == a_segs:
+            self._edit_segments()
         elif act == a_csv:
             self._attach_csv()
         elif act == a_nocsv:
@@ -1711,7 +2560,8 @@ class MainWindow(QMainWindow):
             src.setForeground(QColor("#9aa3b5"))
             self.table.setItem(r, self.COL_SRC, src)
             seg = QTableWidgetItem(self._seg_text(j))
-            seg.setToolTip(j.csv_path or "No CSV: the whole video is extracted")
+            seg.setToolTip(self._seg_tip(j))
+            seg.setForeground(QColor("#9ec1ff" if j.cuts else "#e6e8ee"))
             seg.setFlags(seg.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(r, self.COL_SEG, seg)
             out = QTableWidgetItem("")
@@ -1745,6 +2595,10 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _seg_text(j: Job) -> str:
+        if j.cuts:
+            n = len(j.cuts)
+            kept = segments_total(j.cuts, j.info.duration) if j.info and j.info.duration > 0 else None
+            return f"✂ {n} segment{'s' if n != 1 else ''}" + (f" · {fmt_duration(kept)}" if kept is not None else "")
         if j.csv_path:
             try:
                 n = len(load_segments(j.csv_path))
@@ -1752,6 +2606,21 @@ class MainWindow(QMainWindow):
             except OSError:
                 return "CSV missing!"
         return "Whole video"
+
+    @staticmethod
+    def _seg_tip(j: Job) -> str:
+        segs = j.segments()
+        if j.cuts:
+            head = "Segments marked in the program (double-click to edit):"
+        elif j.csv_path:
+            head = f"Segments from {j.csv_path}:"
+        else:
+            return "The whole video is extracted. Double-click to mark segments."
+        lines = [f"  {i}.  {fmt_tc(st)}  →  {fmt_tc(en) if en is not None else 'end'}"
+                 for i, (st, en) in enumerate(segs[:30], 1)]
+        if len(segs) > 30:
+            lines.append(f"  … and {len(segs) - 30} more")
+        return head + "\n" + "\n".join(lines)
 
     def _update_rows(self) -> None:
         for r, j in enumerate(self.jobs):
@@ -1885,7 +2754,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.setText("Stop")
         self.btn_bench.setEnabled(not on)
         self.settings_panel.setEnabled(not on)
-        for b in (self.b_add, self.b_rename, self.b_auto, self.b_csv, self.b_nocsv,
+        for b in (self.b_add, self.b_segs, self.b_rename, self.b_auto, self.b_csv, self.b_nocsv,
                   self.b_remove, self.b_clear):
             b.setEnabled(not on)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers if on else
@@ -1913,6 +2782,14 @@ class MainWindow(QMainWindow):
         if self.bench_result is not None:
             self._bench_done(*self.bench_result)
             self.bench_result = None
+        if getattr(self, "_probed", False) and not self._running():
+            self._probed = False
+            for r, j in enumerate(self.jobs):
+                it = self.table.item(r, self.COL_SEG)
+                if it is not None and it.text() != self._seg_text(j):
+                    it.setText(self._seg_text(j))
+                    it.setToolTip(self._seg_tip(j))
+            self._update_rows()
         e = self.engine
         if e is None:
             return
